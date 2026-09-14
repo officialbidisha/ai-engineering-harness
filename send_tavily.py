@@ -1,6 +1,9 @@
 import os
 import asyncio
 import hashlib
+import json
+import logging
+import time
 from typing import TypedDict, Annotated
 import operator
 import requests
@@ -20,6 +23,15 @@ load_dotenv("/Users/bidishadas/Desktop/ResolveFlow/.env")
 tavily = AsyncTavilyClient(api_key=os.environ["TAVILY_API_KEY"])
 openai_client = AsyncOpenAI(api_key=os.environ["OPENAI_API_KEY"])
 MAX_QUERIES = 5
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+tracer = logging.getLogger("trace")
+
+
+def log_span(span: str, **fields) -> None:
+    """One structured, parseable log line per stage -- span name, timing, outcome.
+    Real infra would ship this to an observability backend; the shape is the point."""
+    tracer.info(json.dumps({"span": span, **fields}))
 
 
 class FanState(TypedDict):
@@ -66,14 +78,21 @@ def fan_out(state: FanState):
 
 
 async def retrieve(state: SubState) -> dict:
+    start = time.perf_counter()
     try:
         result = await tavily.search(query=state["query"], max_results=2, include_raw_content=False)
         hits = [
             {"query": state["query"], "title": r["title"], "content": r["content"]}
             for r in result["results"]
         ]
+        log_span("retrieve", query=state["query"], outcome="success",
+                  elapsed_ms=round((time.perf_counter() - start) * 1000, 1),
+                  n_results=len(hits))
     except (UsageLimitExceededError, BadRequestError, ForbiddenError, InvalidAPIKeyError, TavilyTimeoutError, requests.exceptions.RequestException) as e:
         hits = [{"query":state["query"], "error": str(e)}]
+        log_span("retrieve", query=state["query"], outcome="error",
+                  elapsed_ms=round((time.perf_counter() - start) * 1000, 1),
+                  error=str(e))
     return {"hits": hits}
 
 
@@ -93,6 +112,7 @@ async def compile_answer(state: FanState) -> dict:
             "answer": "Could not retrieve any results — all queries failed.",
         }
 
+    start = time.perf_counter()
     response = await openai_client.chat.completions.parse(
         model="gpt-4o-mini",
         messages=[
@@ -104,6 +124,9 @@ async def compile_answer(state: FanState) -> dict:
     parsed = response.choices[0].message.parsed
     answer = parsed.answer
     fabricated = [s for s in parsed.sources if s not in source_ids]
+    log_span("compile_answer", outcome="success",
+              elapsed_ms=round((time.perf_counter() - start) * 1000, 1),
+              n_good_hits=len(good_hits), n_fabricated=len(fabricated))
 
     notes = []
     if failed_queries:
