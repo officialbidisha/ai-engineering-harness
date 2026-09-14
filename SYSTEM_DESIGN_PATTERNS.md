@@ -267,23 +267,65 @@ request-count budget a single expensive call can blow through unnoticed.
 Layer a **hard per-tenant/per-task ceiling** on top of the bucket so one
 workflow can't exhaust the shared budget for everyone else.
 
-**2. Fail open or fail closed when the budget/routing service itself is
+**2. The routing layer itself runs as many replicas behind a load
+balancer — how do you enforce one global budget across all of them,
+without each replica's local limiter effectively multiplying the limit
+by the replica count?**
+Four options, in increasing order of how well they actually scale:
+
+- **Centralized counter (Redis, atomic `INCR`+`EXPIRE` or a Lua script
+  for token-bucket math).** Every replica checks the same counter, so
+  the limit is exact and global. The cost isn't just latency — it turns
+  Redis into a **hard dependency on the request path**: if it's slow,
+  every request is slow; if it's down, rate limiting is down.
+- **Local limiter at `limit / N`.** Zero coordination, zero added
+  latency — each replica just enforces its own slice. Falls apart the
+  moment load isn't evenly spread across replicas: one replica can be
+  wrongly rejecting requests while its siblings sit on unused budget,
+  even though the *system-wide* total is well under the real limit.
+- **Distributed token bucket with lease-based refill — the usual
+  production answer.** Each replica periodically checks out a block of
+  tokens from the central bucket (say 50 at once) and spends them
+  locally, re-leasing when low, instead of hitting Redis on every
+  request. This amortizes the network cost over many requests, and the
+  imprecision it introduces is *bounded by the lease size*: a bigger
+  lease means fewer round trips but more slack (more possible
+  over-admission across the fleet before the next lease corrects it); a
+  smaller lease approaches the centralized counter's exactness at the
+  cost of approaching its network overhead too. Lease size is the actual
+  dial between "cheap and approximate" and "expensive and exact" — it's
+  not a separate fourth option, it's a continuum the first two options
+  sit at the ends of.
+- **Fail open or fail closed when the centralized piece itself is down**
+  — see below; it's a distinct decision from which of the three
+  enforcement strategies above you pick.
+
+**3. Fail open or fail closed when the budget/routing service itself is
 down?**
 Decided deliberately, and **per tier** — if the budget service is
 unavailable, does a request proceed anyway (risking an unbounded bill)
 or get rejected (degrading availability to protect spend)? Fail closed
 on the expensive tier, fail open on the cheap one: the cost of a
 short availability hit on cheap traffic is lower than the cost of an
-unbounded bill on expensive traffic.
+unbounded bill on expensive traffic. Worth noticing this compounds with
+deep dive 2's centralized-counter option specifically: if all 20
+replicas share one Redis instance and you fail closed, a single Redis
+outage becomes a **synchronized full-fleet outage**, not a contained
+one — every replica fails the same way at the same time, because they
+all depend on the same thing. A more resilient version keeps a
+conservative local fallback limiter (option 2's shape) that only
+activates when the centralized path is detected as down, trading
+perfect accuracy for partial availability during that window rather
+than an all-or-nothing failure.
 
-**3. How do we detect a provider degradation and route around it before
+**4. How do we detect a provider degradation and route around it before
 it fully fails?**
 Track latency/error rate per provider and fall back to the tier's backup
 provider proactively, rather than waiting for hard failures — the same
 principle as a circuit breaker, applied at the routing layer instead of
 inside each individual agent.
 
-**4. How do we know the tiering policy itself is still correct over
+**5. How do we know the tiering policy itself is still correct over
 time?**
 Track cost and latency **per tier**, not in aggregate — an aggregate
 number hides whether the expensive tier is being over-used for tasks
