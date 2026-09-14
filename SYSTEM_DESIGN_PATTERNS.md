@@ -557,3 +557,99 @@ both scoped to one segment, not the whole organization.
   accuracy and trustworthiness are different measurements, and treating
   a high golden-set score as sufficient evidence for full rollout is the
   most common mistake this framework is designed to prevent.
+
+---
+
+## 5. Caching, situationally
+
+Caching rarely shows up as its own design problem here — it shows up as a
+follow-up inside design 1 or 2 once a cache is on the whiteboard. The
+questions below are the shapes that follow-up actually takes.
+
+**1. How do we keep a cache from serving stale data after the underlying
+record is updated?**
+Invalidate (delete the key) on write, don't update it in place. An
+in-place update races with a concurrent reader who fetched the old DB
+value before the write and caches it *after* the write completes —
+leaving stale data cached with no TTL boundary to eventually correct it.
+Deleting is idempotent under that race: the next read simply misses and
+repopulates from the source of truth.
+
+**2. What happens when a popular key expires and hundreds of requests
+land on it in the same instant?**
+A cache stampede — every one of them misses and every one of them hits
+the database at once, often at exactly the moment popularity makes that
+worst. Two standard fixes: a per-key lock so only one caller repopulates
+while the rest wait (or get served stale data during the window), or
+probabilistic early expiry — refresh a key slightly before its TTL, with
+a probability that rises as the key ages, so refreshes spread out instead
+of synchronizing on the expiry instant.
+
+**3. Local cache per replica, or one centralized cache shared by the
+fleet?**
+Local is zero-hop and fast, but every replica starts cold independently
+and two replicas can disagree about the same key at the same moment —
+fine for pure performance, risky for anything where staleness has a real
+cost. Centralized (e.g. Redis) gives the whole fleet one consistent view
+at the cost of a network hop per request and a new shared dependency.
+Neither is a universal answer — the choice tracks how expensive
+disagreement between replicas actually is for that specific cache.
+
+**4. What stops a single bulk scan from evicting everyone else's warm
+working set?**
+Plain LRU treats every scanned item as "most recently used," so a one-off
+sequential scan of cold data (a bulk export, a manager pulling every
+record in a territory) evicts the entire hot working set on its way
+through — even though none of the evicted items had anything to do with
+the scan. A scan-resistant eviction policy — LFU with decay, or an
+admission filter (e.g. TinyLFU) — only lets a key stay if it's actually
+been accessed repeatedly, so a scanned-once key is evicted immediately
+without displacing anything hot.
+
+**5. How do we actually choose a TTL, rather than picking a number?**
+It's a cost trade-off, not a constant: weigh the cost of serving stale
+data against the cost of an extra cache miss, for that specific entity.
+Fast-changing, consequential data (a deal's live status) gets a short
+TTL — minutes — because a stale read costs more than a miss. Slow-
+changing, low-stakes data can tolerate a much longer one. Be able to name
+what would change the number, not just defend the number itself.
+
+**6. How does cache locality interact with load balancing on LLM-serving
+infrastructure specifically?**
+Prompt/prefix caching (provider-side prompt caching, or KV-cache reuse on
+self-hosted inference) works by keeping a shared prompt prefix's
+attention state resident so a later request with the same prefix skips
+recomputing it — but that cache is local to whichever server instance
+built it. Round-robin load balancing scatters repeated requests for the
+same context across every replica, so each one rebuilds the prefix from
+scratch: a caching feature paid for and barely used, roughly a `1/N` hit
+rate. The fix is sticky routing — consistent-hash on a key that matches
+the cache key (e.g. `tenant:promptVersion:entityId`) so repeated requests
+for the same context land on the replica that already holds it, and
+because the routing is consistent-hashed, adding a replica under load
+only moves a small fraction of keys instead of invalidating every warm
+prefix in the fleet. The honest trade-off to name: sticky routing gives
+up perfect load balance — a hot key pins load onto one node — and the
+production compromise is bounded-load consistent hashing: route to the
+preferred node, but spill to the next one clockwise if it's over a load
+threshold.
+
+**7. Can a cache leak data across users, and how do we prevent it?**
+Yes, if the cache key isn't scoped tightly enough. A semantically-cached
+LLM response or a shared retrieval cache keyed only on the query text —
+not on `(user, query)` or `(tenant, query)` — can serve one user's cached
+answer, built from data only they were authorized to see, straight to a
+different user asking something similar. This is the same underlying
+failure as ACL leakage through post-filtered retrieval (design 1, deep
+dive 2), just relocated into the cache key instead of the query path —
+the fix is the same principle: authorization has to be part of what
+identifies the cached entry, not bolted on after a hit.
+
+**8. What's the failure mode if the cache goes down entirely, and which
+do we choose?**
+The same fail-open/fail-closed judgment call as the rate limiter and the
+model-routing budget service (design 2): fail open falls through to the
+database directly — slower, but still correct; treating the cache as a
+hard dependency turns a cache outage into a full outage. State the choice
+explicitly per cache rather than defaulting into whichever one the
+framework happens to do automatically.
